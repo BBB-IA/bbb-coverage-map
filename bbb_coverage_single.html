@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>BBB Coverage Map — Single‑File</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+  <style>
+    html, body { height: 100%; margin: 0; padding: 0; }
+    #map { height: 82vh; width: 100%; }
+    .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:10px; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+    .btn { padding:8px 12px; border:1px solid #ddd; border-radius:10px; cursor:pointer; background:white; }
+    .btn:hover { background:#f5f5f5; }
+    .muted { color:#555; font-size:13px; }
+    .input { padding:8px 10px; border:1px solid #ddd; border-radius:10px; min-width:280px; }
+    .msg { margin-left: 6px; font-size:14px; }
+    .error { color:#b91c1c; }
+    .ok { color:#166534; }
+    label.switch { display:flex; align-items:center; gap:6px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="bar">
+    <strong>BBB Coverage Map — Greater Iowa, Quad Cities & Siouxland</strong>
+    <input id="q" class="input" placeholder="ZIP, city, or county (e.g., 50309 • Cedar Rapids • Scott County IA)"/>
+    <button id="search" class="btn">Search</button>
+    <button id="export" class="btn">Export GeoJSON</button>
+    <label class="switch"><input type="checkbox" id="toggleLabel"/> Show city label</label>
+    <span class="muted">Blue = Covered · Green = Match (covered) · Red = Match (not covered)</span>
+    <span id="msg" class="msg"></span>
+  </div>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="https://cdn.jsdelivr.net/npm/topojson-client@3/dist/topojson-client.min.js"></script>
+  <script>
+    const COUNTY_TOPO_URL = "https://cdn.jsdelivr.net/npm/us-atlas@3/counties-10m.json";
+    const NOMINATIM = "https://nominatim.openstreetmap.org/search";
+    const FIPS = { IA: "19", IL: "17", NE: "31", SD: "46" };
+    const EXCLUDED_IA = new Set(["19085","19165","19155","19029","19129","19137","19071","19145"]);
+    const EXTRA_INCLUDE = new Set(["17161","17073","31173","31051","31043","46027","46127"]);
+    const SD_NOT_COVERED = new Set(["46135","46125","46083","46099"]);
+
+    const LOCAL_GAZ = [
+      {name:"des moines", state:"IA", lat:41.5868, lon:-93.6250, fips:"19153"},
+      {name:"iowa city", state:"IA", lat:41.6611, lon:-91.5302, fips:"19103"},
+      {name:"cedar rapids", state:"IA", lat:41.9779, lon:-91.6656, fips:"19113"},
+      {name:"cedar falls", state:"IA", lat:42.5349, lon:-92.4453, fips:"19013"},
+      {name:"newton", state:"IA", lat:41.6997, lon:-93.0469, fips:"19099"},
+      {name:"toledo", state:"IA", lat:41.9936, lon:-92.5769, fips:"19171"},
+      {name:"malcolm", state:"IA", lat:41.706,  lon:-92.556,  fips:"19157"},
+      {name:"colfax", state:"IA", lat:41.677,  lon:-93.245,  fips:"19099"},
+      {name:"chariton", state:"IA", lat:41.013, lon:-93.306,  fips:"19117"},
+      {name:"knoxville", state:"IA", lat:41.320, lon:-93.103,  fips:"19125"},
+      {name:"sioux city", state:"IA", lat:42.499, lon:-96.400, fips:"19193"},
+      {name:"davenport", state:"IA", lat:41.523, lon:-90.577, fips:"19163"},
+      {name:"rock island", state:"IL", lat:41.509, lon:-90.578, fips:"17161"},
+      {name:"moline", state:"IL", lat:41.506, lon:-90.515, fips:"17161"}
+    ];
+
+    function featuresToBounds(features) {
+      let minLat=90, maxLat=-90, minLng=180, maxLng=-180;
+      features.forEach(f => {
+        const geom = f.geometry;
+        function pushCoords(coords) {
+          coords.forEach(c => {
+            if (typeof c[0] === "number") {
+              const lng = c[0], lat = c[1];
+              if (lat < minLat) minLat = lat;
+              if (lat > maxLat) maxLat = lat;
+              if (lng < minLng) minLng = lng;
+              if (lng > maxLng) maxLng = lng;
+            } else { pushCoords(c); }
+          });
+        }
+        if (geom.type === "Polygon") pushCoords(geom.coordinates);
+        if (geom.type === "MultiPolygon") geom.coordinates.forEach(pushCoords);
+      });
+      if (minLat === 90) return [[40.3, -97.0], [43.9, -90.0]];
+      return [[minLat, minLng], [maxLat, maxLng]];
+    }
+
+    function centroidOfGeometry(geometry){
+      const pts = []; function pushCoords(coords){ coords.forEach(c=>{ if (typeof c[0]==="number") pts.push([c[1],c[0]]); else pushCoords(c); }); }
+      if (geometry.type === "Polygon") pushCoords(geometry.coordinates);
+      if (geometry.type === "MultiPolygon") geometry.coordinates.forEach(pushCoords);
+      if (!pts.length) return null; let lat=0,lng=0; pts.forEach(([a,b])=>{lat+=a; lng+=b;}); return [lat/pts.length, lng/pts.length];
+    }
+    function pointInRing(point, ring){ let [x,y]=point, inside=false; for(let i=0,j=ring.length-1;i<ring.length;j=i++){const [xi,yi]=ring[i],[xj,yj]=ring[j]; const intersect=((yi>y)!==(yj>y)) && (x<((xj-xi)*(y-yi))/(yj-yi+0.0)+xi); if(intersect) inside=!inside;} return inside; }
+    function pointInPolygon(lng,lat,geometry){ if(geometry.type==='Polygon'){ const [outer]=geometry.coordinates; return pointInRing([lng,lat], outer);} if(geometry.type==='MultiPolygon'){ return geometry.coordinates.some(poly=>pointInRing([lng,lat], poly[0])); } return false; }
+
+    function normalizeCounty(s){ return s.toLowerCase().replace(/county/g,'').replace(/\./g,'').replace(/\s+/g,' ').trim(); }
+    function normalizeHead(s){ return (s||'').split(',')[0].trim().toLowerCase(); }
+    function parseStateFromQuery(q){ const t=q.toLowerCase();
+      if (/\b(iowa|ia)\b/.test(t)) return FIPS.IA;
+      if (/\b(illinois|il)\b/.test(t)) return FIPS.IL;
+      if (/\b(nebraska|ne)\b/.test(t)) return FIPS.NE;
+      if (/\b(south dakota|sd)\b/.test(t)) return FIPS.SD;
+      return null;
+    }
+    function matchCountyByNameExact(q, allRelevant){
+      const st = parseStateFromQuery(q);
+      const base = normalizeCounty(q);
+      for (const f of allRelevant){
+        const fips = String(f.id).padStart(5,"0");
+        const fState = fips.slice(0,2);
+        const nm = normalizeCounty((f.properties && f.properties.name) || '');
+        if ((base === nm) && (!st || st === fState)) return f;
+      }
+      return null;
+    }
+
+    function pickBestGeocode(queryRaw, results){
+      const qHead = normalizeHead(queryRaw);
+      const cityTypes = new Set(['city','town','village','hamlet','locality','suburb','neighbourhood','municipality']);
+      const isIowa = (x) => (x?.address?.state === 'Iowa') || (x?.address?.state_code === 'IA') || /\bIowa\b/i.test(x?.display_name||'');
+
+      const exactCity = results.filter(r => cityTypes.has(r.type||'') && normalizeHead(r.display_name) === qHead)
+                               .sort((a,b) => (isIowa(b)?1:0) - (isIowa(a)?1:0));
+      if (exactCity[0]) return exactCity[0];
+
+      const cityLike = results.filter(r => cityTypes.has(r.type||''))
+                              .sort((a,b) => (isIowa(b)?1:0) - (isIowa(a)?1:0));
+      if (cityLike[0]) return cityLike[0];
+
+      const typeScore = (t) => ({ postcode:7, city:6, town:6, village:5, hamlet:5, locality:5, suburb:4, municipality:4, neighbourhood:3, county:1, state:0 })[t] ?? 2;
+      results.sort((a,b) => {
+        const ts = (x) => typeScore(x.type||"") + (isIowa(x)?100:0);
+        return ts(b) - ts(a);
+      });
+      if ((results[0]?.type === 'county')){
+        const alt = results.find(x => x.type !== 'county');
+        if (alt) return alt;
+      }
+      return results[0];
+    }
+
+    const map = L.map('map', { zoomSnap: 0.25, wheelPxPerZoomLevel: 90 });
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+
+    const layerIndex = new Map();
+    let selectedFips = null;
+    let markerLayer = null;
+
+    const xIcon = L.divIcon({ className:'not-covered-x', html:'<div style="color:#dc2626;font-size:22px;font-weight:700;line-height:1;">✕</div>', iconSize:[16,16], iconAnchor:[8,8] });
+    const searchIconGreen = L.divIcon({ className:'search-dot-green', html:'<div style="width:10px;height:10px;border-radius:50%;background:#16a34a;border:2px solid #fff;box-shadow:0 0 0 2px #16a34a"></div>', iconSize:[10,10], iconAnchor:[5,5] });
+    const searchIconRed = L.divIcon({ className:'search-dot-red', html:'<div style="width:10px;height:10px;border-radius:50%;background:#dc2626;border:2px solid #fff;box-shadow:0 0 0 2px #dc2626"></div>', iconSize:[10,10], iconAnchor:[5,5] });
+
+    function message(txt, ok=false){ const el=document.getElementById('msg'); el.textContent = txt; el.className = 'msg ' + (ok?'ok':'error'); }
+
+    fetch(COUNTY_TOPO_URL)
+      .then(r => { if(!r.ok) throw new Error('County dataset fetch failed: ' + r.status); return r.json(); })
+      .then(topo => {
+        const counties = topojson.feature(topo, topo.objects.counties);
+        const included=[], excludedIA=[], sdNotCovered=[], allRelevant=[];
+        counties.features.forEach(f=>{
+          const id=String(f.id).padStart(5,"0"); const st=id.slice(0,2);
+          if (st===FIPS.IA){ if(EXCLUDED_IA.has(id)){ excludedIA.push(f); allRelevant.push(f);} else { included.push(f); allRelevant.push(f);} }
+          else if (EXTRA_INCLUDE.has(id)){ included.push(f); allRelevant.push(f); }
+          else if (st===FIPS.SD && SD_NOT_COVERED.has(id)){ sdNotCovered.push(f); allRelevant.push(f); }
+        });
+
+        const coveredStyle = { color: "#1e40af", weight: 1.6, fillOpacity: 0.18 };
+        const notCoveredStyle = { color: "#dc2626", weight: 1.4, fillOpacity: 0.08, dashArray: "4 3" };
+        const selectedCoveredStyle = { color: "#16a34a", weight: 3, fillOpacity: 0.25 };
+        const selectedNotCoveredStyle = { color: "#dc2626", weight: 3, fillOpacity: 0.20 };
+
+        function addGeo(features, style, label){
+          const layer = L.geoJSON({type:'FeatureCollection', features}, {
+            style: (feature)=> {
+              const base = Object.assign({}, style);
+              base.__baseStyle = style;
+              return base;
+            },
+            onEachFeature: (feature, lyr) => {
+              const fips = String(feature.id).padStart(5,"0"); layerIndex.set(fips, lyr);
+              const st = fips.slice(0,2);
+              const stateName = st==="19"?"Iowa":st==="17"?"Illinois":st==="31"?"Nebraska":st==="46"?"South Dakota":"";
+              const nm = feature.properties && feature.properties.name ? feature.properties.name : "County";
+              lyr.bindTooltip(`${nm}, ${stateName} — FIPS ${fips} (${label})`, {sticky:true});
+              lyr.options.__baseStyle = style;
+            }
+          }).addTo(map);
+          return layer;
+        }
+
+        addGeo(included, coveredStyle, 'Covered');
+        const exclLayer = addGeo(excludedIA, notCoveredStyle, 'Not Covered');
+        const sdLayer = addGeo(sdNotCovered, notCoveredStyle, 'Not Covered');
+
+        function addXs(layer){ layer.eachLayer(lyr => { const c = centroidOfGeometry(lyr.feature.geometry); if (c) L.marker(c, {icon:xIcon}).addTo(map); }); }
+        addXs(exclLayer); addXs(sdLayer);
+
+        const covBounds = featuresToBounds([...included, ...excludedIA, ...sdNotCovered]);
+        map.fitBounds(covBounds);
+
+        function setSelected(fips, isCovered, isNotCovered){
+          if (selectedFips && layerIndex.get(selectedFips)) {
+            const lyr = layerIndex.get(selectedFips);
+            lyr.setStyle(lyr.options.__baseStyle || coveredStyle);
+          }
+          selectedFips = fips;
+          const lyr = layerIndex.get(fips);
+          if (!lyr) return;
+          if (isNotCovered) lyr.setStyle(selectedNotCoveredStyle);
+          else if (isCovered) lyr.setStyle(selectedCoveredStyle);
+          else lyr.setStyle(selectedCoveredStyle);
+        }
+
+        function dropSearchMarker(lat, lon, place=false, label='', coveredFlag=true){
+          if (markerLayer) { map.removeLayer(markerLayer); markerLayer = null; }
+          if (!lat || !lon) return;
+          const showLabel = document.getElementById('toggleLabel').checked;
+          const icon = coveredFlag ? searchIconGreen : searchIconRed;
+          const m = L.marker([lat, lon], { icon });
+          if (place && showLabel){ m.bindTooltip(label, { permanent:true, direction:'top' }); }
+          m.addTo(map); markerLayer = m;
+        }
+
+        function tryLocalGaz(qRaw){
+          const head = normalizeHead(qRaw);
+          const wantsState = /\\b(IA|Iowa|Illinois|IL|Nebraska|NE|South Dakota|SD)\\b/i.test(qRaw);
+          const statePref = wantsState ? null : "IA";
+          const matches = LOCAL_GAZ.filter(x => x.name === head && (!wantsState ? (statePref ? x.state === statePref : true) : true));
+          return matches.length ? matches[0] : null;
+        }
+
+        function doSearch(){
+          const qRaw = document.getElementById('q').value.trim();
+          message(''); if (!qRaw) return;
+
+          if (/\\bcounty\\b/i.test(qRaw)){
+            const nameHit = matchCountyByNameExact(qRaw, [...included, ...excludedIA, ...sdNotCovered]);
+            if (nameHit){
+              const fips = String(nameHit.id).padStart(5,"0");
+              const st = fips.slice(0,2);
+              const covered = (st===FIPS.IA && !EXCLUDED_IA.has(fips)) || EXTRA_INCLUDE.has(fips);
+              const notCovered = (st===FIPS.IA && EXCLUDED_IA.has(fips)) || (st===FIPS.SD && SD_NOT_COVERED.has(fips));
+              setSelected(fips, covered, notCovered);
+              const lyr = layerIndex.get(fips); if (lyr) map.fitBounds(lyr.getBounds(), { maxZoom: 9 });
+              const countyName = nameHit.properties?.name || 'County';
+              dropSearchMarker(null, null, false);
+              message(`${countyName} County — ${st==="19"?"Iowa":st==="17"?"Illinois":st==="31"?"Nebraska":st==="46"?"South Dakota":""} → ${covered?"IN our area":notCovered?"NOT in our area":"Not in our defined set"}`, covered);
+              return;
+            }
+          } else {
+            const local = tryLocalGaz(qRaw);
+            if (local){
+              const fips = local.fips;
+              const st = fips.slice(0,2);
+              const covered = (st===FIPS.IA && !EXCLUDED_IA.has(fips)) || EXTRA_INCLUDE.has(fips);
+              const notCovered = (st===FIPS.IA && EXCLUDED_IA.has(fips)) || (st===FIPS.SD && SD_NOT_COVERED.has(fips));
+              setSelected(fips, covered, notCovered);
+              const lyr = layerIndex.get(fips); if (lyr) map.fitBounds(lyr.getBounds(), { maxZoom: 9 });
+              dropSearchMarker(local.lat, local.lon, true, qRaw, covered && !notCovered);
+              const countyName = (lyr && lyr.feature?.properties?.name) ? lyr.feature.properties.name : "County";
+              message(`${qRaw} → ${countyName} County — ${st==="19"?"Iowa":st==="17"?"Illinois":st==="31"?"Nebraska":st==="46"?"South Dakota":""} → ${covered?"IN our area":notCovered?"NOT in our area":"Not in our defined set"}`, covered && !notCovered);
+              return;
+            }
+          }
+
+          const nameHit = matchCountyByNameExact(qRaw, [...included, ...excludedIA, ...sdNotCovered]);
+          if (nameHit){
+            const fips = String(nameHit.id).padStart(5,"0");
+            const st = fips.slice(0,2);
+            const covered = (st===FIPS.IA && !EXCLUDED_IA.has(fips)) || EXTRA_INCLUDE.has(fips);
+            const notCovered = (st===FIPS.IA && EXCLUDED_IA.has(fips)) || (st===FIPS.SD && SD_NOT_COVERED.has(fips));
+            setSelected(fips, covered, notCovered);
+            const lyr = layerIndex.get(fips); if (lyr) map.fitBounds(lyr.getBounds(), { maxZoom: 9 });
+            const countyName = nameHit.properties?.name || 'County';
+            dropSearchMarker(null, null, false);
+            message(`${countyName} County — ${st==="19"?"Iowa":st==="17"?"Illinois":st==="31"?"Nebraska":st==="46"?"South Dakota":""} → ${covered?"IN our area":notCovered?"NOT in our area":"Not in our defined set"}`, covered && !notCovered);
+            return;
+          }
+
+          const wantsState = /\\b(IA|Iowa|Illinois|IL|Nebraska|NE|South Dakota|SD)\\b/i.test(qRaw);
+          const q = wantsState ? qRaw : `${qRaw}, Iowa`;
+
+          const url = new URL(NOMINATIM);
+          url.searchParams.set('q', q);
+          url.searchParams.set('countrycodes','us');
+          url.searchParams.set('format','json');
+          url.searchParams.set('addressdetails','1');
+          url.searchParams.set('limit','10');
+          fetch(url.toString(), { headers: { 'Accept': 'application/json' }})
+            .then(r => { if(!r.ok) throw new Error('Geocode failed: '+r.status); return r.json(); })
+            .then(arr => {
+              if (!Array.isArray(arr) || arr.length === 0){ message('No match found. Tip: add a state or try a county name like "Scott County IA".'); return; }
+              const filtered = /\\bcounty\\b/i.test(qRaw) ? arr : arr.filter(x => x.type !== 'county');
+              const chosen = filtered.length ? pickBestGeocode(qRaw, filtered) : pickBestGeocode(qRaw, arr);
+
+              const pts = [];
+              const lat = parseFloat(chosen.lat), lon = parseFloat(chosen.lon);
+              if (!Number.isNaN(lat) && !Number.isNaN(lon)) pts.push([lon, lat]);
+              if (chosen.boundingbox && chosen.boundingbox.length === 4){
+                const [s, n, w, e] = chosen.boundingbox.map(Number);
+                if ([s,n,w,e].every(v => !Number.isNaN(v))) pts.push([(w+e)/2, (s+n)/2]);
+              }
+
+              let found = null, used = null;
+              outer: for (const [LON, LAT] of pts){
+                for (const f of [...included, ...excludedIA, ...sdNotCovered]){
+                  if (pointInPolygon(LON, LAT, f.geometry)) { found = f; used = [LAT, LON]; break outer; }
+                }
+              }
+              if (!found){ message('Location found, but not in a county we track here. (Outside our region.)', false); return; }
+
+              const fips = String(found.id).padStart(5,"0");
+              const st = fips.slice(0,2);
+              const covered = (st===FIPS.IA && !EXCLUDED_IA.has(fips)) || EXTRA_INCLUDE.has(fips);
+              const notCovered = (st===FIPS.IA && EXCLUDED_IA.has(fips)) || (st===FIPS.SD && SD_NOT_COVERED.has(fips));
+              setSelected(fips, covered, notCovered);
+              const lyr = layerIndex.get(fips); if (lyr) map.fitBounds(lyr.getBounds(), { maxZoom: 9 });
+              const countyName = (found.properties && found.properties.name) || 'County';
+              const label = chosen.display_name ? `${chosen.display_name.split(',')[0]}` : qRaw;
+              dropSearchMarker(used ? used[0] : null, used ? used[1] : null, true, label, covered && !notCovered);
+              message(`${label} → ${countyName} County — ${st==="19"?"Iowa":st==="17"?"Illinois":st==="31"?"Nebraska":st==="46"?"South Dakota":""} → ${covered?"IN our area":notCovered?"NOT in our area":"Not in our defined set"}`, covered && !notCovered);
+            })
+            .catch(err => { message('Search error: '+ err + '. Tip: you can also type a county name, e.g., "Rock Island County IL".'); });
+        }
+
+        document.getElementById('search').addEventListener('click', doSearch);
+        document.getElementById('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
+
+        document.getElementById('export').addEventListener('click', () => {
+          const fc = {
+            type: "FeatureCollection",
+            features: [
+              ...included.map(f => ({ type:'Feature', id:String(f.id).padStart(5,"0"), properties:{status:'covered'}, geometry:f.geometry })),
+              ...excludedIA.map(f => ({ type:'Feature', id:String(f.id).padStart(5,"0"), properties:{status:'not_covered_IA_excluded'}, geometry:f.geometry })),
+              ...sdNotCovered.map(f => ({ type:'Feature', id:String(f.id).padStart(5,"0"), properties:{status:'not_covered_SD_neighbor'}, geometry:f.geometry })),
+            ]
+          };
+          const blob = new Blob([JSON.stringify(fc, null, 2)], {type: "application/json"});
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = "bbb-coverage-counties-with-not-covered.geojson";
+          a.click();
+          URL.revokeObjectURL(url);
+        });
+      })
+      .catch(err => {
+        message('Could not load county boundaries (' + err + '). If your network blocks CDNs, I can send a truly offline single-file on request.', false);
+      });
+  </script>
+</body>
+</html>
